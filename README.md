@@ -35,6 +35,13 @@ jot serve --port=8080        # custom port
 jot serve --data=/var/jot    # custom data dir
 ```
 
+Environment variables:
+
+- `PORT` — server port (overridden by `--port`)
+- `DATA_DIR` — data directory (overridden by `--data`)
+- `JOT_API_KEY` — preconfigured owner API key accepted in addition to the keys stored in `auth.json`. Useful for headless deployments where you want to bake the key into your env / secrets manager instead of provisioning it through the UI.
+- `JOT_API_KEY_LABEL` — label shown as the author name for actions performed with `JOT_API_KEY` (defaults to `env`).
+
 ## Docker
 
 ```bash
@@ -128,6 +135,37 @@ All owner endpoints require `Authorization: Bearer <api-key>`.
 | GET    | `/api/keys`                           | List API keys                       |
 | POST   | `/api/keys`                           | Create API key                      |
 | DELETE | `/api/keys/:id`                       | Delete API key                      |
+
+### MCP
+
+A Streamable HTTP MCP endpoint is exposed at `POST /mcp`, gated by the same Bearer auth as the rest of the owner API (including `JOT_API_KEY`). Each request is stateless — there are no sessions to manage, so `GET /mcp` and `DELETE /mcp` return 405.
+
+Tools mirror the owner-mode CLI subcommands:
+
+| Tool                 | CLI equivalent                                              |
+| -------------------- | ----------------------------------------------------------- |
+| `list_notes`         | `jot <inst> list`                                           |
+| `search_notes`       | `jot <inst> search <query>`                                 |
+| `read_note`          | `jot <inst> read <id> [--offset=N] [--limit=M]`             |
+| `create_note`        | `jot <inst> create [title]`                                 |
+| `update_note`        | `jot <inst> update <id> title\|markdown <value>`            |
+| `delete_note`        | `jot <inst> delete <id>`                                    |
+| `edit_note`          | `jot <inst> edit <id> '[{"oldText","newText"}]'`            |
+| `share_note`         | `jot <inst> share <id> none\|view\|comment\|edit`           |
+| `add_comment`        | `jot <inst> comment <id> <quote> <body>`                    |
+| `reply_to_comment`   | `jot <inst> reply <id> <threadId> <messageId> <body>`       |
+| `resolve_thread`     | `jot <inst> resolve <id> <threadId>`                        |
+| `reopen_thread`      | `jot <inst> reopen <id> <threadId>`                         |
+| `delete_thread`      | `jot <inst> delete-thread <id> <threadId>`                  |
+| `edit_comment`       | `jot <inst> edit-comment <id> <messageId> <body>`           |
+| `delete_comment`     | `jot <inst> delete-comment <id> <messageId>`                |
+
+Register from Claude Code:
+
+```bash
+claude mcp add --transport http jot https://jot.example.com/mcp \
+  --header "Authorization: Bearer <api-key>"
+```
 
 Share endpoints (no auth, access controlled by `shareAccess`):
 

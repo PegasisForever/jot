@@ -25,72 +25,53 @@ import {
   idBeforeIndex,
   idAtIndex,
 } from "./collab.js";
+import {
+  type ApiResult,
+  type CommentAnchor,
+  type CommentMessage,
+  type CommentThread,
+  type NoteMetaFile,
+  type NoteRecord,
+  type NoteSummary,
+  type ShareAccess,
+  notes,
+  notesEvents,
+  configureNotesApi,
+  ensureDirectories,
+  loadNotesIntoMemory,
+  noteMarkdownPath,
+  noteMetaPath,
+  readJson,
+  writeJson,
+  persistNote,
+  findNoteByShareId,
+  locateMessage,
+  summarizeNote,
+  normalizeTitle,
+  normalizeCommentBody,
+  countOccurrences,
+  nowIso,
+  createId,
+  createShortId,
+  listNotes as apiListNotes,
+  readNote as apiReadNote,
+  createNote as apiCreateNote,
+  updateNote as apiUpdateNote,
+  deleteNote as apiDeleteNote,
+  applyEdits as apiApplyEdits,
+  addThread as apiAddThread,
+  addReply as apiAddReply,
+  setThreadResolved as apiSetThreadResolved,
+  deleteThread as apiDeleteThread,
+  editMessage as apiEditMessage,
+  deleteMessage as apiDeleteMessage,
+} from "./notes-api.js";
+import { buildMcpServer } from "./mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import hljs from "highlight.js";
 import { marked, type Tokens } from "marked";
 import sanitizeHtml from "sanitize-html";
 
-
-type CommentAnchor = {
-  quote: string;
-  prefix: string;
-  suffix: string;
-  start: number;
-  end: number;
-};
-
-type CommentMessage = {
-  id: string;
-  parentId: string | null;
-  authorId: string;
-  authorName: string;
-  body: string;
-  createdAt: string;
-  updatedAt: string;
-};
-
-type CommentThread = {
-  id: string;
-  resolved: boolean;
-  createdAt: string;
-  updatedAt: string;
-  anchor: CommentAnchor;
-  messages: CommentMessage[];
-};
-
-type ShareAccess = "none" | "view" | "comment" | "edit";
-
-type NoteMetaFile = {
-  id: string;
-  title: string;
-  shareId: string;
-  shareAccess: ShareAccess;
-  createdAt: string;
-  updatedAt: string;
-  threads: CommentThread[];
-  collab?: SavedCollabState;
-  collabState?: SavedCollabState;
-};
-
-type NoteRecord = {
-  id: string;
-  title: string;
-  shareId: string;
-  shareAccess: ShareAccess;
-  createdAt: string;
-  updatedAt: string;
-  threads: CommentThread[];
-  markdown: string;
-  collab: CollabState;
-  clientAcks: Map<string, number>;
-};
-
-type NoteSummary = {
-  id: string;
-  title: string;
-  updatedAt: string;
-  shareId: string;
-  snippet: string;
-};
 
 type DeviceToken = {
   id: string;
@@ -128,7 +109,8 @@ function cliArg(name: string) {
 
 const port = Number(cliArg("port") || process.env.PORT || 3210);
 const dataDir = cliArg("data") || process.env.DATA_DIR || path.join(process.cwd(), "data");
-const notesDir = path.join(dataDir, "notes");
+const envApiKey = process.env.JOT_API_KEY || null;
+const envApiKeyLabel = process.env.JOT_API_KEY_LABEL || "env";
 const authFilePath = path.join(dataDir, "auth.json");
 const publicDir = path.join(path.resolve(__dirname, ".."), "public");
 const ownerSessionCookieName = "md_owner_session";
@@ -137,7 +119,8 @@ const commenterIdCookieName = "md_commenter_id";
 const commenterNameCookieName = "md_commenter_name";
 const ownerCookieMaxAgeSeconds = 60 * 60 * 24 * 30;
 const commenterCookieMaxAgeSeconds = 60 * 60 * 24 * 365;
-const notes = new Map<string, NoteRecord>();
+
+configureNotesApi({ dataDir });
 
 const codeRenderer = new marked.Renderer();
 codeRenderer.code = ({ text, lang }: Tokens.Code) => {
@@ -162,12 +145,35 @@ marked.setOptions({
 ensureDirectories();
 loadNotesIntoMemory();
 
+notesEvents.on("note-updated", (note) => broadcastNoteUpdate(note));
+notesEvents.on("threads-updated", (note) => broadcastThreadsUpdated(note));
+notesEvents.on("editor-hello", (note) => broadcastEditorHello(note));
+notesEvents.on("editor-mutation", (note, msg) => broadcastEditorMutation(note, msg));
+notesEvents.on("share-access-changed", (note) => enforceShareAccessForConnections(note));
+
 const app = express();
 app.set("trust proxy", true);
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 app.use("/static", express.static(publicDir));
 app.use("/static/mermaid", express.static(path.join(path.resolve(__dirname, ".."), "node_modules", "mermaid", "dist")));
+
+function sendApiResult<T>(res: Response, result: ApiResult<T>) {
+  if (!result.ok) {
+    const payload: Record<string, unknown> = { ok: false, error: result.error };
+    if (result.errors) payload.errors = result.errors;
+    res.status(result.status).json(payload);
+    return;
+  }
+  const { ok: _ok, ...rest } = result as unknown as Record<string, unknown> & { ok: true };
+  res.json({ ok: true, ...rest });
+}
+
+function resolveOwnerAuthorName(req: Request) {
+  const bearer = getBearerToken(req);
+  const apiKeyLabel = bearer ? getApiKeyLabel(bearer) : null;
+  return apiKeyLabel || "Owner";
+}
 
 app.get("/health", (_req, res) => {
   res.type("text/plain").send("ok");
@@ -297,367 +303,102 @@ app.delete("/api/keys/:id", requireOwnerApi, (req, res) => {
 });
 
 app.post("/api/notes/:id/edit", requireOwnerApi, (req, res) => {
-  const note = notes.get(String(req.params.id));
-  if (!note) {
-    res.status(404).json({ ok: false, error: "Note not found." });
-    return;
-  }
-
-  const edits = req.body.edits;
-  if (!Array.isArray(edits) || edits.length === 0) {
-    res.status(400).json({ ok: false, error: "edits must be a non-empty array of {oldText, newText}." });
-    return;
-  }
-
-  let workingCollab = note.collab;
-  let markdown = note.markdown;
-  let senderCounter = 0;
-  const errors: string[] = [];
-  const idListUpdates: ServerMutationMessage["idListUpdates"] = [];
-
-  for (let i = 0; i < edits.length; i++) {
-    const edit = edits[i];
-    const oldText = String(edit?.oldText || "");
-    const newText = String(edit?.newText || "");
-
-    if (!oldText) {
-      errors.push(`Edit ${i}: oldText is empty.`);
-      continue;
-    }
-
-    const firstIndex = markdown.indexOf(oldText);
-    if (firstIndex === -1) {
-      errors.push(`Edit ${i}: oldText not found.`);
-      continue;
-    }
-
-    const secondIndex = markdown.indexOf(oldText, firstIndex + 1);
-    if (secondIndex !== -1) {
-      errors.push(`Edit ${i}: oldText is ambiguous (found ${countOccurrences(markdown, oldText)} times).`);
-      continue;
-    }
-
-    let nextClientCounter = senderCounter + 1;
-    const mutations: ClientMutation[] = [];
-
-    if (oldText.length > 0) {
-      mutations.push({
-        name: "delete",
-        clientCounter: nextClientCounter++,
-        args: {
-          startId: idAtIndex(workingCollab, firstIndex),
-          endId: idAtIndex(workingCollab, firstIndex + oldText.length - 1),
-          contentLength: oldText.length,
-        },
-      });
-    }
-
-    if (newText.length > 0) {
-      mutations.push({
-        name: "insert",
-        clientCounter: nextClientCounter++,
-        args: {
-          before: firstIndex > 0 ? idBeforeIndex(workingCollab, firstIndex) : null,
-          id: { bunchId: crypto.randomUUID(), counter: 0 },
-          content: newText,
-          isInWord: false,
-        },
-      });
-    }
-
-    const result = applyClientMutations(workingCollab, mutations);
-    workingCollab = result.state;
-    markdown = result.markdown;
-    idListUpdates.push(...result.idListUpdates);
-    senderCounter = mutations.at(-1)?.clientCounter || senderCounter;
-  }
-
-  if (errors.length > 0) {
-    res.status(400).json({ ok: false, errors });
-    return;
-  }
-
-  note.collab = workingCollab;
-  note.markdown = markdown;
-  note.updatedAt = nowIso();
-  const titleChanged = Object.prototype.hasOwnProperty.call(req.body || {}, "title")
-    && normalizeTitle(String(req.body.title || note.title)) !== note.title;
-  if (Object.prototype.hasOwnProperty.call(req.body || {}, "title")) {
-    note.title = normalizeTitle(String(req.body.title || note.title));
-  }
-  persistNote(note, false);
-
-  if (titleChanged) {
-    broadcastEditorHello(note);
-  } else if (idListUpdates.length > 0) {
-    broadcastEditorMutation(note, {
-      type: "mutation",
-      senderId: "__api__",
-      senderCounter,
-      serverCounter: note.collab.serverCounter,
-      markdown: note.markdown,
-      idListUpdates,
-    });
-  }
-  broadcastNoteUpdate(note);
-
-  res.json({ ok: true, savedAt: note.updatedAt });
+  const result = apiApplyEdits({
+    id: String(req.params.id),
+    edits: req.body.edits,
+    title: Object.prototype.hasOwnProperty.call(req.body || {}, "title") ? String(req.body.title || "") : undefined,
+  });
+  sendApiResult(res, result);
 });
 
 app.post("/api/notes/:id/threads", requireOwnerApi, (req, res) => {
-  const note = notes.get(String(req.params.id));
-  if (!note) {
-    res.status(404).json({ ok: false, error: "Note not found." });
-    return;
-  }
-
-  const quote = String(req.body.quote || "");
-  const body = normalizeCommentBody(String(req.body.body || ""));
-  if (!quote || !body) {
-    res.status(400).json({ ok: false, error: "quote and body are required." });
-    return;
-  }
-
-  const start = note.markdown.indexOf(quote);
-  if (start === -1) {
-    res.status(400).json({ ok: false, error: "Quoted text not found in note." });
-    return;
-  }
-
-  const prefix = note.markdown.slice(Math.max(0, start - 32), start);
-  const end = start + quote.length;
-  const suffix = note.markdown.slice(end, end + 32);
-
-  const bearer = getBearerToken(req);
-  const apiKeyLabel = bearer ? getApiKeyLabel(bearer) : null;
-  const authorName = apiKeyLabel || "Owner";
-
-  const anchor: CommentAnchor = { quote, prefix, suffix, start, end };
-  const thread: CommentThread = {
-    id: createId(10),
-    resolved: false,
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
-    anchor,
-    messages: [
-      {
-        id: createId(10),
-        parentId: null,
-        authorId: "__owner__",
-        authorName,
-        body,
-        createdAt: nowIso(),
-        updatedAt: nowIso(),
-      },
-    ],
-  };
-
-  note.threads.push(thread);
-  note.updatedAt = nowIso();
-  persistNote(note);
-  broadcastThreadsUpdated(note);
-  res.json({ ok: true, thread: { id: thread.id } });
+  const result = apiAddThread(
+    { id: String(req.params.id), quote: String(req.body.quote || ""), body: String(req.body.body || "") },
+    { authorName: resolveOwnerAuthorName(req) },
+  );
+  sendApiResult(res, result);
 });
 
 app.post("/api/notes/:id/threads/:threadId/replies", requireOwnerApi, (req, res) => {
-  const note = notes.get(String(req.params.id));
-  if (!note) {
-    res.status(404).json({ ok: false, error: "Note not found." });
-    return;
-  }
-
-  const thread = note.threads.find((t) => t.id === String(req.params.threadId));
-  if (!thread) {
-    res.status(404).json({ ok: false, error: "Thread not found." });
-    return;
-  }
-
-  const body = normalizeCommentBody(String(req.body.body || ""));
-  const parentMessageId = String(req.body.parentMessageId || thread.messages[0]?.id || "");
-  if (!body) {
-    res.status(400).json({ ok: false, error: "body is required." });
-    return;
-  }
-
-  if (!thread.messages.some((m) => m.id === parentMessageId)) {
-    res.status(400).json({ ok: false, error: "Parent message not found." });
-    return;
-  }
-
-  const bearer = getBearerToken(req);
-  const apiKeyLabel = bearer ? getApiKeyLabel(bearer) : null;
-  const authorName = apiKeyLabel || "Owner";
-  const timestamp = nowIso();
-
-  thread.messages.push({
-    id: createId(10),
-    parentId: parentMessageId,
-    authorId: "__owner__",
-    authorName,
-    body,
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  });
-  thread.updatedAt = timestamp;
-  note.updatedAt = timestamp;
-  persistNote(note);
-  broadcastThreadsUpdated(note);
-  res.json({ ok: true });
+  const result = apiAddReply(
+    {
+      id: String(req.params.id),
+      threadId: String(req.params.threadId),
+      body: String(req.body.body || ""),
+      parentMessageId: req.body.parentMessageId !== undefined ? String(req.body.parentMessageId) : undefined,
+    },
+    { authorName: resolveOwnerAuthorName(req) },
+  );
+  sendApiResult(res, result);
 });
 
 app.patch("/api/notes/:id/threads/:threadId", requireOwnerApi, (req, res) => {
-  const note = notes.get(String(req.params.id));
-  if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
-  const thread = note.threads.find((t) => t.id === String(req.params.threadId));
-  if (!thread) { res.status(404).json({ ok: false, error: "Thread not found." }); return; }
-  thread.resolved = Boolean(req.body.resolved);
-  thread.updatedAt = nowIso();
-  note.updatedAt = thread.updatedAt;
-  persistNote(note);
-  broadcastThreadsUpdated(note);
-  res.json({ ok: true });
+  const result = apiSetThreadResolved({
+    id: String(req.params.id),
+    threadId: String(req.params.threadId),
+    resolved: Boolean(req.body.resolved),
+  });
+  sendApiResult(res, result);
 });
 
 app.delete("/api/notes/:id/threads/:threadId", requireOwnerApi, (req, res) => {
-  const note = notes.get(String(req.params.id));
-  if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
-  note.threads = note.threads.filter((t) => t.id !== String(req.params.threadId));
-  note.updatedAt = nowIso();
-  persistNote(note);
-  broadcastThreadsUpdated(note);
-  res.json({ ok: true });
+  const result = apiDeleteThread({ id: String(req.params.id), threadId: String(req.params.threadId) });
+  sendApiResult(res, result);
 });
 
 app.patch("/api/notes/:id/messages/:messageId", requireOwnerApi, (req, res) => {
-  const note = notes.get(String(req.params.id));
-  if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
-  const located = locateMessage(note, String(req.params.messageId));
-  if (!located) { res.status(404).json({ ok: false, error: "Message not found." }); return; }
-  const body = normalizeCommentBody(String(req.body.body || ""));
-  if (!body) { res.status(400).json({ ok: false, error: "Body is required." }); return; }
-  located.message.body = body;
-  located.message.updatedAt = nowIso();
-  located.thread.updatedAt = located.message.updatedAt;
-  note.updatedAt = located.message.updatedAt;
-  persistNote(note);
-  broadcastThreadsUpdated(note);
-  res.json({ ok: true });
+  const result = apiEditMessage({
+    id: String(req.params.id),
+    messageId: String(req.params.messageId),
+    body: String(req.body.body || ""),
+  });
+  sendApiResult(res, result);
 });
 
 app.delete("/api/notes/:id/messages/:messageId", requireOwnerApi, (req, res) => {
-  const note = notes.get(String(req.params.id));
-  if (!note) { res.status(404).json({ ok: false, error: "Note not found." }); return; }
-  const located = locateMessage(note, String(req.params.messageId));
-  if (!located) { res.status(404).json({ ok: false, error: "Message not found." }); return; }
-  located.thread.messages = located.thread.messages.filter((m) => m.id !== located.message.id);
-  if (located.thread.messages.length === 0) {
-    note.threads = note.threads.filter((t) => t.id !== located.thread.id);
-  } else {
-    located.thread.updatedAt = nowIso();
-  }
-  note.updatedAt = nowIso();
-  persistNote(note);
-  broadcastThreadsUpdated(note);
-  res.json({ ok: true });
+  const result = apiDeleteMessage({ id: String(req.params.id), messageId: String(req.params.messageId) });
+  sendApiResult(res, result);
 });
 
 app.delete("/api/notes/:id", requireOwnerApi, (req, res) => {
-  const id = String(req.params.id);
-  const note = notes.get(id);
-  if (!note) {
-    res.status(404).json({ ok: false, error: "Note not found." });
-    return;
-  }
-
-  notes.delete(id);
-  try { fs.unlinkSync(noteMarkdownPath(id)); } catch {}
-  try { fs.unlinkSync(noteMetaPath(id)); } catch {}
-  res.json({ ok: true });
+  const result = apiDeleteNote({ id: String(req.params.id) });
+  sendApiResult(res, result);
 });
 
 app.get("/api/notes", requireOwnerApi, (req, res) => {
-  const query = String(req.query.q || "");
-  const results = searchNotes(query);
-  res.json({ ok: true, notes: results });
+  const result = apiListNotes({ q: req.query.q ? String(req.query.q) : undefined });
+  sendApiResult(res, result);
 });
 
 app.post("/api/notes", requireOwnerApi, (_req, res) => {
-  const note = createNote();
-  res.json({ ok: true, note: summarizeNote(note, "") });
+  const result = apiCreateNote();
+  sendApiResult(res, result);
 });
 
 app.get("/api/notes/:id", requireOwnerApi, (req, res) => {
-  const note = notes.get(String(req.params.id));
-  if (!note) {
-    res.status(404).json({ ok: false, error: "Note not found." });
+  const result = apiReadNote({
+    id: String(req.params.id),
+    offset: req.query.offset ? Number(req.query.offset) : null,
+    limit: req.query.limit ? Number(req.query.limit) : null,
+  });
+  if (!result.ok) { sendApiResult(res, result); return; }
+  if (result.kind === "paginated") {
+    res.json({ ok: true, note: result.note });
     return;
   }
-
-  const offset = req.query.offset ? Number(req.query.offset) : null;
-  const limit = req.query.limit ? Number(req.query.limit) : null;
-
-  if (offset !== null || limit !== null) {
-    const lines = note.markdown.split("\n");
-    const start = Math.max(0, (offset || 1) - 1);
-    const end = limit ? Math.min(lines.length, start + limit) : lines.length;
-    const slice = lines.slice(start, end);
-    const totalLines = lines.length;
-    const remaining = totalLines - end;
-
-    res.json({
-      ok: true,
-      note: {
-        id: note.id,
-        title: note.title,
-        totalLines,
-        offset: start + 1,
-        limit: slice.length,
-        remaining,
-        content: slice.map((line, i) => `${start + i + 1}: ${line}`).join("\n"),
-      },
-    });
-    return;
-  }
-
+  const note = notes.get(String(req.params.id))!;
   res.json({ ok: true, ...serializeNoteForClient(note, req) });
 });
 
 app.put("/api/notes/:id", requireOwnerApi, (req, res) => {
-  const note = notes.get(String(req.params.id));
-  if (!note) {
-    res.status(404).json({ ok: false, error: "Note not found." });
-    return;
-  }
-
-  const titleProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "title");
-  const markdownProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "markdown");
-  const shareAccessProvided = Object.prototype.hasOwnProperty.call(req.body || {}, "shareAccess");
-  const nextTitle = titleProvided ? normalizeTitle(String(req.body.title || note.title)) : note.title;
-  const nextMarkdown = markdownProvided ? String(req.body.markdown || "") : note.markdown;
-  const nextShareAccess = shareAccessProvided && ["none", "view", "comment", "edit"].includes(req.body.shareAccess)
-    ? (req.body.shareAccess as ShareAccess)
-    : note.shareAccess;
-  const titleChanged = nextTitle !== note.title;
-  const markdownChanged = nextMarkdown !== note.markdown;
-
-  const shareAccessChanged = nextShareAccess !== note.shareAccess;
-
-  note.title = nextTitle;
-  note.shareAccess = nextShareAccess;
-  if (markdownChanged) {
-    note.collab = collabFromMarkdown(nextMarkdown, note.collab.serverCounter + 1);
-    note.markdown = nextMarkdown;
-  }
-  note.updatedAt = nowIso();
-  persistNote(note, false);
-  if (shareAccessChanged) {
-    enforceShareAccessForConnections(note);
-  }
-  if (titleChanged || markdownChanged || shareAccessChanged) {
-    broadcastEditorHello(note);
-    broadcastNoteUpdate(note);
-  }
-  res.json({ ok: true, savedAt: note.updatedAt, shareAccess: note.shareAccess });
+  const body = req.body || {};
+  const result = apiUpdateNote({
+    id: String(req.params.id),
+    title: Object.prototype.hasOwnProperty.call(body, "title") ? String(body.title || "") : undefined,
+    markdown: Object.prototype.hasOwnProperty.call(body, "markdown") ? String(body.markdown || "") : undefined,
+    shareAccess: Object.prototype.hasOwnProperty.call(body, "shareAccess") ? (body.shareAccess as ShareAccess) : undefined,
+  });
+  sendApiResult(res, result);
 });
 
 app.get("/api/notes/:id/collab", requireOwnerApi, (req, res) => {
@@ -1037,6 +778,29 @@ app.delete("/api/share/:shareId/messages/:messageId", (req, res) => {
   res.json({ ok: true, threads: serializeThreads(note, req) });
 });
 
+app.post("/mcp", requireOwnerApi, async (req, res) => {
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const mcp = buildMcpServer({ authorName: resolveOwnerAuthorName(req) });
+  res.on("close", () => { transport.close(); mcp.close(); });
+  try {
+    await mcp.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error("MCP error:", error);
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal MCP error" }, id: null });
+    }
+  }
+});
+
+app.get("/mcp", requireOwnerApi, (_req, res) => {
+  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "GET not supported (stateless transport)" }, id: null });
+});
+
+app.delete("/mcp", requireOwnerApi, (_req, res) => {
+  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "DELETE not supported (stateless transport)" }, id: null });
+});
+
 app.use((_req, res) => {
   res.status(404).send(renderSimplePage("Not found", `<p>Page not found.</p>`));
 });
@@ -1372,188 +1136,6 @@ server.listen(port, () => {
   console.log(`data: ${path.resolve(dataDir)}`);
 });
 
-function ensureDirectories() {
-  fs.mkdirSync(dataDir, { recursive: true });
-  fs.mkdirSync(notesDir, { recursive: true });
-}
-
-function loadNotesIntoMemory() {
-  notes.clear();
-  const files = fs.readdirSync(notesDir).filter((file) => file.endsWith(".md"));
-
-  for (const file of files) {
-    const id = path.basename(file, ".md");
-    const markdownPath = noteMarkdownPath(id);
-    const metaPath = noteMetaPath(id);
-    if (!fs.existsSync(metaPath)) {
-      continue;
-    }
-
-    const markdown = fs.readFileSync(markdownPath, "utf8");
-    const meta = readJson<NoteMetaFile | null>(metaPath, null);
-    if (!meta) {
-      continue;
-    }
-
-    const threads = Array.isArray(meta.threads)
-      ? meta.threads.map((thread) => ({
-          ...thread,
-          messages: Array.isArray(thread.messages)
-            ? thread.messages.map((message) => ({
-                ...message,
-                parentId: typeof message.parentId === "string" ? message.parentId : null,
-              }))
-            : [],
-        }))
-      : [];
-
-    let collab: CollabState;
-    if (meta.collab) {
-      collab = loadCollabState(meta.collab);
-    } else if (meta.collabState) {
-      collab = loadCollabState(meta.collabState);
-    } else {
-      collab = collabFromMarkdown(markdown);
-    }
-
-    notes.set(id, {
-      ...meta,
-      shareAccess: (meta.shareAccess as ShareAccess) || "none",
-      markdown: collabToMarkdown(collab),
-      threads,
-      collab,
-      clientAcks: new Map(),
-    });
-  }
-}
-
-function noteMarkdownPath(id: string) {
-  return path.join(notesDir, `${id}.md`);
-}
-
-function noteMetaPath(id: string) {
-  return path.join(notesDir, `${id}.json`);
-}
-
-function readJson<T>(filePath: string, fallback: T) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8")) as T;
-  } catch {
-    return fallback;
-  }
-}
-
-function writeJson(filePath: string, value: unknown) {
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-}
-
-function createNote() {
-  const timestamp = nowIso();
-  const id = createShortId();
-  const note: NoteRecord = {
-    id,
-    title: "untitled",
-    shareId: createShortId(14),
-    shareAccess: "none",
-    createdAt: timestamp,
-    updatedAt: timestamp,
-    markdown: "",
-    threads: [],
-    collab: newCollabState(),
-    clientAcks: new Map(),
-  };
-
-  notes.set(id, note);
-  persistNote(note);
-  return note;
-}
-
-function persistNote(note: NoteRecord, broadcastUpdate = true) {
-  note.markdown = collabToMarkdown(note.collab);
-
-  const meta: NoteMetaFile = {
-    id: note.id,
-    title: note.title,
-    shareId: note.shareId,
-    shareAccess: note.shareAccess,
-    createdAt: note.createdAt,
-    updatedAt: note.updatedAt,
-    threads: note.threads,
-    collab: saveCollabState(note.collab),
-  };
-
-  fs.writeFileSync(noteMarkdownPath(note.id), note.markdown, "utf8");
-  writeJson(noteMetaPath(note.id), meta);
-  if (broadcastUpdate) {
-    broadcastNoteUpdate(note);
-  }
-}
-
-function searchNotes(query: string) {
-  const needle = query.trim().toLowerCase();
-  return Array.from(notes.values())
-    .map((note) => summarizeNote(note, needle))
-    .filter((note) => {
-      if (!needle) {
-        return true;
-      }
-
-      return note.title.toLowerCase().includes(needle) || note.snippet.toLowerCase().includes(needle);
-    })
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-}
-
-function summarizeNote(note: NoteRecord, needle: string): NoteSummary {
-  return {
-    id: note.id,
-    title: note.title,
-    updatedAt: note.updatedAt,
-    shareId: note.shareId,
-    snippet: buildSnippet(note, needle),
-  };
-}
-
-function buildSnippet(note: NoteRecord, needle: string) {
-  const source = note.markdown.replace(/\s+/g, " ").trim();
-  if (!source) {
-    return "";
-  }
-
-  if (!needle) {
-    return source.slice(0, 140);
-  }
-
-  const index = source.toLowerCase().indexOf(needle);
-  if (index === -1) {
-    return source.slice(0, 140);
-  }
-
-  const start = Math.max(0, index - 40);
-  const end = Math.min(source.length, index + needle.length + 80);
-  return source.slice(start, end);
-}
-
-function findNoteByShareId(shareId: string) {
-  for (const note of notes.values()) {
-    if (note.shareId === shareId) {
-      return note;
-    }
-  }
-
-  return null;
-}
-
-function locateMessage(note: NoteRecord, messageId: string) {
-  for (const thread of note.threads) {
-    const message = thread.messages.find((item) => item.id === messageId);
-    if (message) {
-      return { thread, message };
-    }
-  }
-
-  return null;
-}
-
 function buildViewerInfo(
   req: Request,
   overrides?: { commenterNameOverride?: string; hasCommenterIdentityOverride?: boolean },
@@ -1656,24 +1238,6 @@ function requireShareAccess(req: Request, res: Response, minAccess: ShareAccess)
   return note;
 }
 
-function countOccurrences(haystack: string, needle: string) {
-  let count = 0;
-  let index = haystack.indexOf(needle);
-  while (index !== -1) {
-    count++;
-    index = haystack.indexOf(needle, index + 1);
-  }
-  return count;
-}
-
-function normalizeTitle(input: string) {
-  return input.trim().slice(0, 160) || "untitled";
-}
-
-function normalizeCommentBody(input: string) {
-  return input.trim().slice(0, 4000);
-}
-
 function normalizeCommenterName(input: string) {
   return input.trim().slice(0, 80);
 }
@@ -1741,18 +1305,6 @@ function makeShareUrl(req: Request, shareId: string) {
   return `${req.protocol}://${req.get("host")}/s/${shareId}`;
 }
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function createShortId(length = 8) {
-  return crypto.randomBytes(length).toString("base64url").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, length);
-}
-
-function createId(length = 12) {
-  return createShortId(length);
-}
-
 function escapeHtml(input: string) {
   return input
     .replaceAll("&", "&amp;")
@@ -1769,6 +1321,15 @@ function hashSecret(value: string, salt: string) {
 function secureEqualsHex(a: string, b: string) {
   const left = Buffer.from(a, "hex");
   const right = Buffer.from(b, "hex");
+  if (left.length !== right.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(left, right);
+}
+
+function secureEqualsString(a: string, b: string) {
+  const left = Buffer.from(a, "utf8");
+  const right = Buffer.from(b, "utf8");
   if (left.length !== right.length) {
     return false;
   }
@@ -1956,6 +1517,10 @@ function getBearerToken(req: Request) {
 }
 
 function verifyApiKey(key: string) {
+  if (envApiKey && secureEqualsString(key, envApiKey)) {
+    return true;
+  }
+
   const auth = loadAuthData();
   if (!auth || !auth.apiKeys) {
     return false;
@@ -1971,6 +1536,10 @@ function verifyApiKey(key: string) {
 }
 
 function getApiKeyLabel(key: string): string | null {
+  if (envApiKey && secureEqualsString(key, envApiKey)) {
+    return envApiKeyLabel;
+  }
+
   const auth = loadAuthData();
   if (!auth || !auth.apiKeys) {
     return null;
