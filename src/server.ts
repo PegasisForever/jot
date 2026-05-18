@@ -108,6 +108,9 @@ function cliArg(name: string) {
 }
 
 const port = Number(cliArg("port") || process.env.PORT || 3210);
+const mcpPort = Number(cliArg("mcp-port") || process.env.MCP_PORT || port + 1);
+const mcpHost = process.env.MCP_HOST || "127.0.0.1";
+const mcpAuthorLabel = process.env.MCP_AUTHOR_LABEL || "agent";
 const dataDir = cliArg("data") || process.env.DATA_DIR || path.join(process.cwd(), "data");
 const envApiKey = process.env.JOT_API_KEY || null;
 const envApiKeyLabel = process.env.JOT_API_KEY_LABEL || "env";
@@ -778,29 +781,6 @@ app.delete("/api/share/:shareId/messages/:messageId", (req, res) => {
   res.json({ ok: true, threads: serializeThreads(note, req) });
 });
 
-app.post("/mcp", requireOwnerApi, async (req, res) => {
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  const mcp = buildMcpServer({ authorName: resolveOwnerAuthorName(req) });
-  res.on("close", () => { transport.close(); mcp.close(); });
-  try {
-    await mcp.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  } catch (error) {
-    console.error("MCP error:", error);
-    if (!res.headersSent) {
-      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal MCP error" }, id: null });
-    }
-  }
-});
-
-app.get("/mcp", requireOwnerApi, (_req, res) => {
-  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "GET not supported (stateless transport)" }, id: null });
-});
-
-app.delete("/mcp", requireOwnerApi, (_req, res) => {
-  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "DELETE not supported (stateless transport)" }, id: null });
-});
-
 app.use((_req, res) => {
   res.status(404).send(renderSimplePage("Not found", `<p>Page not found.</p>`));
 });
@@ -1134,6 +1114,40 @@ function broadcastPresenceLeave(sender: ClientConn) {
 server.listen(port, () => {
   console.log(`jot listening on http://localhost:${port}`);
   console.log(`data: ${path.resolve(dataDir)}`);
+});
+
+// MCP runs on its own port with no auth. Bind to 127.0.0.1 by default so a
+// careless port mapping doesn't expose full owner access to the network.
+const mcpApp = express();
+mcpApp.use(express.json({ limit: "2mb" }));
+
+mcpApp.post("/mcp", async (req, res) => {
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  const mcp = buildMcpServer({ authorName: mcpAuthorLabel });
+  res.on("close", () => { transport.close(); mcp.close(); });
+  try {
+    await mcp.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error("MCP error:", error);
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal MCP error" }, id: null });
+    }
+  }
+});
+
+mcpApp.get("/mcp", (_req, res) => {
+  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "GET not supported (stateless transport)" }, id: null });
+});
+
+mcpApp.delete("/mcp", (_req, res) => {
+  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "DELETE not supported (stateless transport)" }, id: null });
+});
+
+mcpApp.get("/health", (_req, res) => { res.type("text/plain").send("ok"); });
+
+http.createServer(mcpApp).listen(mcpPort, mcpHost, () => {
+  console.log(`jot MCP listening on http://${mcpHost}:${mcpPort}/mcp (no auth, author: ${mcpAuthorLabel})`);
 });
 
 function buildViewerInfo(

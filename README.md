@@ -41,8 +41,50 @@ Environment variables:
 - `DATA_DIR` — data directory (overridden by `--data`)
 - `JOT_API_KEY` — preconfigured owner API key accepted in addition to the keys stored in `auth.json`. Useful for headless deployments where you want to bake the key into your env / secrets manager instead of provisioning it through the UI.
 - `JOT_API_KEY_LABEL` — label shown as the author name for actions performed with `JOT_API_KEY` (defaults to `env`).
+- `MCP_PORT` — port for the MCP server (defaults to `PORT + 1`, overridden by `--mcp-port`). See [MCP](#mcp) below.
+- `MCP_HOST` — interface the MCP server binds to. Defaults to `127.0.0.1` (loopback only) because the MCP endpoint has no auth. Set to `0.0.0.0` to expose externally — only do this on a trusted network.
+- `MCP_AUTHOR_LABEL` — author name attached to comments/replies made through MCP (defaults to `agent`).
 
 ## Docker
+
+Pre-built image: [`pegasis0/jot`](https://hub.docker.com/r/pegasis0/jot).
+
+```bash
+docker run -d --name jot \
+  -p 3210:3210 \
+  -p 127.0.0.1:3211:3211 \
+  -e JOT_API_KEY=change-me \
+  -e MCP_HOST=0.0.0.0 \
+  -v jot-data:/app/data \
+  pegasis0/jot:latest
+```
+
+The `-p 127.0.0.1:3211:3211` binds the MCP port to the host loopback only, so the no-auth MCP endpoint is reachable from agents on the same machine but not from the network. `MCP_HOST=0.0.0.0` is needed *inside* the container so the MCP server accepts connections from the Docker bridge — the loopback binding on the host side is what restricts external access.
+
+Or with `docker-compose.yml`:
+
+```yaml
+services:
+  jot:
+    image: pegasis0/jot:latest
+    container_name: jot
+    restart: unless-stopped
+    ports:
+      - "3210:3210"                 # web UI + REST + WebSocket
+      - "127.0.0.1:3211:3211"       # MCP, loopback-only
+    environment:
+      JOT_API_KEY: change-me
+      JOT_API_KEY_LABEL: env
+      MCP_HOST: 0.0.0.0             # inside the container; host mapping above gates external access
+      MCP_AUTHOR_LABEL: agent
+    volumes:
+      - jot-data:/app/data
+
+volumes:
+  jot-data:
+```
+
+To build from source instead, the repo also ships an opinionated compose setup under `docker/`:
 
 ```bash
 cd docker
@@ -138,7 +180,9 @@ All owner endpoints require `Authorization: Bearer <api-key>`.
 
 ### MCP
 
-A Streamable HTTP MCP endpoint is exposed at `POST /mcp`, gated by the same Bearer auth as the rest of the owner API (including `JOT_API_KEY`). Each request is stateless — there are no sessions to manage, so `GET /mcp` and `DELETE /mcp` return 405.
+A Streamable HTTP MCP endpoint is exposed at `POST /mcp` on a **separate port** (`MCP_PORT`, default `PORT + 1` = `3211`). It is **unauthenticated** — anyone who can reach the port has full owner access. By default the server binds the MCP port to `127.0.0.1`, so on a bare-metal install only local agents can reach it. In Docker the equivalent is publishing the port with a loopback host binding (`127.0.0.1:3211:3211`), as shown in the [Docker](#docker) section.
+
+Each request is stateless — there are no sessions to manage, so `GET /mcp` and `DELETE /mcp` return 405. Comments and replies created through MCP are attributed to the name in `MCP_AUTHOR_LABEL` (default `agent`).
 
 Tools mirror the owner-mode CLI subcommands:
 
@@ -160,11 +204,10 @@ Tools mirror the owner-mode CLI subcommands:
 | `edit_comment`       | `jot <inst> edit-comment <id> <messageId> <body>`           |
 | `delete_comment`     | `jot <inst> delete-comment <id> <messageId>`                |
 
-Register from Claude Code:
+Register from Claude Code (no auth header — the loopback binding is the gate):
 
 ```bash
-claude mcp add --transport http jot https://jot.example.com/mcp \
-  --header "Authorization: Bearer <api-key>"
+claude mcp add --transport http jot http://localhost:3211/mcp
 ```
 
 Share endpoints (no auth, access controlled by `shareAccess`):
