@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 
@@ -7,21 +6,15 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { WebSocketServer, type WebSocket } from "ws";
 
 import {
-  type CollabState,
   type ClientMutation,
   type ClientMutationMessage,
   type ClientPresenceMessage,
-  type SavedCollabState,
   type ServerHelloMessage,
   type ServerMutationMessage,
   type ServerPresenceMessage,
   type ServerPresenceLeaveMessage,
   applyClientMutations,
-  collabFromMarkdown,
-  collabToMarkdown,
   saveCollabState,
-  loadCollabState,
-  newCollabState,
   idBeforeIndex,
   idAtIndex,
 } from "./collab.js";
@@ -30,29 +23,23 @@ import {
   type CommentAnchor,
   type CommentMessage,
   type CommentThread,
-  type NoteMetaFile,
   type NoteRecord,
-  type NoteSummary,
   type ShareAccess,
   notes,
   notesEvents,
   configureNotesApi,
   ensureDirectories,
   loadNotesIntoMemory,
-  noteMarkdownPath,
-  noteMetaPath,
   readJson,
   writeJson,
   persistNote,
   findNoteByShareId,
   locateMessage,
-  summarizeNote,
-  normalizeTitle,
   normalizeCommentBody,
   countOccurrences,
   nowIso,
   createId,
-  createShortId,
+  buildPublicShareUrl,
   listNotes as apiListNotes,
   readNote as apiReadNote,
   createNote as apiCreateNote,
@@ -114,6 +101,7 @@ const mcpAuthorLabel = process.env.MCP_AUTHOR_LABEL || "agent";
 const dataDir = cliArg("data") || process.env.DATA_DIR || path.join(process.cwd(), "data");
 const envApiKey = process.env.JOT_API_KEY || null;
 const envApiKeyLabel = process.env.JOT_API_KEY_LABEL || "env";
+const publicBaseUrl = process.env.JOT_PUBLIC_BASE_URL || null;
 const authFilePath = path.join(dataDir, "auth.json");
 const publicDir = path.join(path.resolve(__dirname, ".."), "public");
 const ownerSessionCookieName = "md_owner_session";
@@ -123,7 +111,7 @@ const commenterNameCookieName = "md_commenter_name";
 const ownerCookieMaxAgeSeconds = 60 * 60 * 24 * 30;
 const commenterCookieMaxAgeSeconds = 60 * 60 * 24 * 365;
 
-configureNotesApi({ dataDir });
+configureNotesApi({ dataDir, publicBaseUrl });
 
 const codeRenderer = new marked.Renderer();
 codeRenderer.code = ({ text, lang }: Tokens.Code) => {
@@ -1316,7 +1304,7 @@ function renderMarkdown(markdown: string) {
 }
 
 function makeShareUrl(req: Request, shareId: string) {
-  return `${req.protocol}://${req.get("host")}/s/${shareId}`;
+  return buildPublicShareUrl(shareId) || `${req.protocol}://${req.get("host")}/s/${shareId}`;
 }
 
 function escapeHtml(input: string) {

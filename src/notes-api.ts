@@ -92,6 +92,7 @@ export type Actor = { authorName: string };
 
 let dataDir: string | null = null;
 let notesDir: string | null = null;
+let publicBaseUrl: string | null = null;
 
 export const notes = new Map<string, NoteRecord>();
 
@@ -115,9 +116,14 @@ class NotesEventEmitter extends EventEmitter {
 
 export const notesEvents = new NotesEventEmitter();
 
-export function configureNotesApi(opts: { dataDir: string }) {
+export function configureNotesApi(opts: { dataDir: string; publicBaseUrl?: string | null }) {
   dataDir = opts.dataDir;
   notesDir = path.join(opts.dataDir, "notes");
+  publicBaseUrl = opts.publicBaseUrl ? opts.publicBaseUrl.replace(/\/+$/, "") : null;
+}
+
+export function buildPublicShareUrl(shareId: string): string | null {
+  return publicBaseUrl ? `${publicBaseUrl}/s/${shareId}` : null;
 }
 
 function getNotesDir(): string {
@@ -341,6 +347,7 @@ export type ReadNoteFull = {
     title: string;
     markdown: string;
     shareId: string;
+    shareUrl?: string;
     shareAccess: ShareAccess;
     updatedAt: string;
     createdAt: string;
@@ -390,6 +397,7 @@ export function readNote(input: { id: string; offset?: number | null; limit?: nu
     };
   }
 
+  const shareUrl = buildPublicShareUrl(note.shareId);
   return {
     ok: true,
     kind: "full",
@@ -398,6 +406,7 @@ export function readNote(input: { id: string; offset?: number | null; limit?: nu
       title: note.title,
       markdown: note.markdown,
       shareId: note.shareId,
+      ...(shareUrl ? { shareUrl } : {}),
       shareAccess: note.shareAccess,
       updatedAt: note.updatedAt,
       createdAt: note.createdAt,
@@ -416,7 +425,7 @@ export function updateNote(input: {
   title?: string;
   markdown?: string;
   shareAccess?: ShareAccess;
-}): ApiResult<{ savedAt: string; shareAccess: ShareAccess }> {
+}): ApiResult<{ savedAt: string; shareAccess: ShareAccess; shareId: string; shareUrl?: string }> {
   const note = notes.get(input.id);
   if (!note) return { ok: false, status: 404, error: "Note not found." };
 
@@ -450,7 +459,14 @@ export function updateNote(input: {
     notesEvents.emit("note-updated", note);
   }
 
-  return { ok: true, savedAt: note.updatedAt, shareAccess: note.shareAccess };
+  const shareUrl = buildPublicShareUrl(note.shareId);
+  return {
+    ok: true,
+    savedAt: note.updatedAt,
+    shareAccess: note.shareAccess,
+    shareId: note.shareId,
+    ...(shareUrl ? { shareUrl } : {}),
+  };
 }
 
 export function deleteNote(input: { id: string }): ApiResult<Record<string, never>> {

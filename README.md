@@ -41,6 +41,7 @@ Environment variables:
 - `DATA_DIR` — data directory (overridden by `--data`)
 - `JOT_API_KEY` — preconfigured owner API key accepted in addition to the keys stored in `auth.json`. Useful for headless deployments where you want to bake the key into your env / secrets manager instead of provisioning it through the UI.
 - `JOT_API_KEY_LABEL` — label shown as the author name for actions performed with `JOT_API_KEY` (defaults to `env`).
+- `JOT_PUBLIC_BASE_URL` — public origin used to build share URLs (e.g. `https://jot.example.com`). When set, `share_note` / `read_note` / REST responses include a `shareUrl` field constructed against this base instead of the incoming request `Host`. Useful behind a reverse proxy and for MCP, since MCP requests have no public Host.
 - `MCP_PORT` — port for the MCP server (defaults to `PORT + 1`, overridden by `--mcp-port`). See [MCP](#mcp) below.
 - `MCP_HOST` — interface the MCP server binds to. Defaults to `127.0.0.1` (loopback only) because the MCP endpoint has no auth. Set to `0.0.0.0` to expose externally — only do this on a trusted network.
 - `MCP_AUTHOR_LABEL` — author name attached to comments/replies made through MCP (defaults to `agent`).
